@@ -3759,7 +3759,10 @@ function makePlugin(site) {
           if (!dailyTasks()) return got
           // the day's other chores, said on the same card: a failure here is
           // never the check-in's outcome, which the card is really about
-          const more = await runDaily(site, a, { gap: 1000 }).catch((e) => ({ credit: 0, logs: [`任务失败：${e?.message ?? e}`] }))
+          // a bounded run: magpie gives a whole check-in round two minutes for
+          // every account, so one account cannot have more than its share, or
+          // the round is recorded failed and the accounts after it fail too
+          const more = await runDaily(site, a, { gap: 150, budgetMs: 30000 }).catch((e) => ({ credit: 0, logs: [`任务失败：${e?.message ?? e}`] }))
           const lines = [...(more.logs ?? [])]
           if (more.credit > 0) lines.unshift(`任务 +${more.credit} 积分`)
           if (!lines.length) return got

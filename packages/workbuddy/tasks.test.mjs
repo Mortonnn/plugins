@@ -322,3 +322,73 @@ test("a failing chore never stops the ones after it", async () => {
   expect(calls.some((c) => c.path === "/activity/growth/buddy/travel/status")).toBe(true)
   expect(out.logs.some((l) => l.startsWith("任务失败"))).toBe(true)
 })
+
+// -- regression: the two bugs the reviewer found in plugins#918 --------------
+
+test("a second day reports again, not skip everything day 1 did", async () => {
+  // `reported` used to be keyed by site and account with no day, so day 2
+  // skipped every code day 1 had seen and no chore ran until a restart.
+  let reports = 0
+  serve({
+    "/v2/activity/growth/tasks": () => ok({ tasks: [task("chat_5", { progress: { current: 0, target: 1 } })] }),
+    "/v2/report": () => { reports++; return ok() },
+    "/activity/growth/tasks/chat_5/claim": () => busy(400, "task not completed"),
+  })
+  const realNow = Date.now
+  const day1 = Date.parse("2026-11-10T02:00:00Z") // 10:00 Beijing
+  try {
+    Date.now = () => day1
+    await tasks.growthTasks(site, auth, { gap: 0 })
+    const afterDay1 = reports
+    expect(afterDay1).toBeGreaterThan(0)
+    Date.now = () => day1 + 86400_000 // the next Beijing day
+    await tasks.growthTasks(site, auth, { gap: 0 })
+    expect(reports).toBe(afterDay1 * 2)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("the same day's second ask reports nothing more", async () => {
+  let reports = 0
+  serve({
+    "/v2/activity/growth/tasks": () => ok({ tasks: [task("chat_5", { progress: { current: 0, target: 1 } })] }),
+    "/v2/report": () => { reports++; return ok() },
+    "/activity/growth/tasks/chat_5/claim": () => busy(400, "task not completed"),
+  })
+  const realNow = Date.now
+  const day = Date.parse("2026-11-10T02:00:00Z")
+  try {
+    Date.now = () => day
+    await tasks.growthTasks(site, auth, { gap: 0 })
+    const first = reports
+    await tasks.growthTasks(site, auth, { gap: 0 })
+    expect(reports).toBe(first)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("a run with no time left asks nothing, so it cannot blow the round's budget", async () => {
+  // magpie gives a whole check-in round 2 minutes for every account; a run
+  // past its share is recorded failed even though the claim went through.
+  const calls = serve({
+    "/v2/activity/growth/tasks": () => ok({ tasks: [task("chat_5")] }),
+    "/v2/report": () => ok(),
+  })
+  const out = await tasks.runDaily(site, auth, { budgetMs: 0 })
+  expect(out.ran).toBe(true)
+  expect(calls).toHaveLength(0)
+})
+
+test("a deadline that passes mid-run stops new work", async () => {
+  const calls = serve({
+    "/v2/activity/growth/tasks": () => ok({ tasks: [task("chat_5", { progress: { current: 0, target: 5 } })] }),
+    "/v2/report": () => ok(),
+  })
+  // budget of 1 ms: the first check is already past it by the time the
+  // reports would start
+  const out = await tasks.growthTasks(site, auth, { gap: 0, deadline: Date.now() - 1 })
+  expect(out.credit).toBe(0)
+  expect(calls.some((c) => c.path === "/v2/report")).toBe(false)
+})

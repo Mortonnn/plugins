@@ -113,6 +113,13 @@ const reported = new Map()
 
 const dayKey = (siteId, uid) => siteId + "|" + uid
 
+// reportKey carries the day. A code reported on day 1 must be reported again
+// on day 2 — the vendor's progress resets with the day's tasks — so the day is
+// part of the key rather than something cleared by a restart. Keyed without
+// it, day 2 skipped every code day 1 had seen, and nothing ran again until the
+// process restarted.
+const reportKey = (siteId, uid, day) => siteId + "|" + uid + "|" + day
+
 // beijingDay is the vendor's own day: a fixed +08:00, no DST, so the same
 // instant names the same day whoever runs this.
 function beijingDay(now = Date.now()) {
@@ -125,6 +132,13 @@ const localHour = () => new Date().getHours()
 const isNight = () => localHour() >= 23 || localHour() < 8
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// A check-in round is one budget for every account magpie has — two minutes as
+// magpie writes it — so the chores must finish well inside it, or the round is
+// recorded failed even though the claim went through, and the accounts after
+// this one in the round fail too. Each run carries a deadline; past it no new
+// work starts and whatever is left keeps for another day.
+const outOfTime = (opts) => !!(opts && opts.deadline) && Date.now() >= opts.deadline
 
 // ---- one request ------------------------------------------------------------
 //
@@ -363,24 +377,28 @@ async function report(site, a, events) {
 // holds is that a task's progress moves only after it is accepted, and that
 // a reported unit is counted once: so the task is re-read after the
 // reports before any claim is asked.
-async function progressOne(site, a, t, { gap = 1000, nick } = {}) {
+async function progressOne(site, a, t, opts = {}) {
+  const { gap = 150, nick } = opts
   if (t.status === "claimed") return 0
   if (claimable(t)) return await claim(site, a, t)
   if (ineligible(t)) return 0
   if (NIGHT_CODES.has(t.code) && !isNight()) return 0
   if (t.status === "not_accepted" && t.type !== "auto") return 0
+  if (outOfTime(opts)) return 0
 
   const need = Math.max(1, t.target - t.current)
   for (let i = 0; i < need; i++) {
+    if (outOfTime(opts)) return 0
     await report(site, a, buildEvents(t, a.uid, nick, i))
     if (i < need - 1) await sleep(gap)
   }
-  await sleep(1500)
+  await sleep(150)
 
   // the vendor's own count, read back: a report the vendor ignored leaves
   // the progress where it was, and a claim then answers 400
   let best = t.current
   for (let attempt = 0; attempt < 6; attempt++) {
+    if (outOfTime(opts)) return 0
     let fresh
     try {
       fresh = (await fetchTasks(site, a)).find((x) => x.code === t.code)
@@ -396,10 +414,10 @@ async function progressOne(site, a, t, { gap = 1000, nick } = {}) {
     }
     if (fresh.current > best) {
       best = fresh.current
-      await sleep(2500)
+      await sleep(400)
       continue
     }
-    if (attempt < 2) await sleep(1500)
+    if (attempt < 2) await sleep(250)
     else break
   }
   return 0
@@ -416,12 +434,20 @@ async function growthTasks(site, a, opts = {}) {
   const tasks = await fetchTasks(site, a)
   if (!tasks.length) return { credit, logs }
 
-  for (const t of tasks.filter((x) => x.type === "auto")) credit += await progressOne(site, a, t, opts)
+  for (const t of tasks.filter((x) => x.type === "auto")) {
+    if (outOfTime(opts)) break
+    credit += await progressOne(site, a, t, opts)
+  }
 
-  await accept(site, a, await fetchTasks(site, a))
+  if (!outOfTime(opts)) await accept(site, a, await fetchTasks(site, a))
 
-  const known = reported.get(dayKey(site.id, a.uid)) ?? new Set()
+  const day = beijingDay()
+  const seenKey = reportKey(site.id, a.uid, day)
+  const known = reported.get(seenKey) ?? new Set()
   for (const t of await fetchTasks(site, a)) {
+    // a run that is out of its time budget stops here; the rest keep for the
+    // next round, since a new day reports them again anyway
+    if (outOfTime(opts)) break
     if (known.has(t.code)) continue
     const got = await progressOne(site, a, t, opts)
     known.add(t.code)
@@ -434,7 +460,11 @@ async function growthTasks(site, a, opts = {}) {
       logs.push(`${t.name}: 需真实操作（${t.spec.reason}）`)
     }
   }
-  reported.set(dayKey(site.id, a.uid), known)
+  reported.set(seenKey, known)
+  // drop other days' marks for this account: they are never read again
+  for (const k of reported.keys()) {
+    if (k !== seenKey && k.startsWith(dayKey(site.id, a.uid) + "|")) reported.delete(k)
+  }
   return { credit, logs }
 }
 
@@ -506,13 +536,14 @@ async function streakBonus(site, a, opts = {}) {
     const chances = Math.max(0, Number(lot?.chances ?? 0) || 0)
     let drawn = 0
     for (let i = 0; i < chances; i++) {
+      if (outOfTime(opts)) break
       try {
         await ask(site, a, "/activity/growth/lottery/draw", { method: "POST", body: { client_token: crypto.randomUUID() } })
         drawn++
       } catch {
         break
       }
-      await sleep(opts.drawGap ?? 1000)
+      await sleep(opts.drawGap ?? 150)
     }
     if (drawn > 0) logs.push(`抽奖 ${drawn} 次`)
   } catch {
@@ -623,13 +654,17 @@ async function runDaily(site, a, opts = {}) {
 
   const logs = []
   let credit = 0
+  // one deadline for the whole account's run, so a slow round cannot starve
+  // the accounts after it in magpie's check-in
+  const runOpts = { gap: 150, ...opts, deadline: Date.now() + (opts.budgetMs ?? 30000) }
   const steps = [
-    ["任务", () => growthTasks(site, a, opts)],
-    ["连登", () => streakBonus(site, a, opts)],
-    ["猫猫旅行", () => catTravel(site, a, opts)],
-    ["盲盒", () => buddyOpen(site, a, opts)],
+    ["任务", () => growthTasks(site, a, runOpts)],
+    ["连登", () => streakBonus(site, a, runOpts)],
+    ["猫猫旅行", () => catTravel(site, a, runOpts)],
+    ["盲盒", () => buddyOpen(site, a, runOpts)],
   ]
   for (const [name, step] of steps) {
+    if (outOfTime(runOpts)) break
     try {
       const out = await step()
       credit += out.credit ?? 0
@@ -637,7 +672,7 @@ async function runDaily(site, a, opts = {}) {
     } catch (e) {
       logs.push(`${name}失败：${e?.message ?? e}`)
     }
-    if (opts.gap) await sleep(opts.gap)
+    if (runOpts.gap) await sleep(runOpts.gap)
   }
   return { credit, logs, ran: true }
 }

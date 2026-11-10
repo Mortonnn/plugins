@@ -603,11 +603,23 @@ is ignored upstream, the progress stays 0 and the claim answers 400. The
 night task (`black_cat`) is only reported between 23:00 and 08:00, in the
 machine's own time zone.
 
-Two limits worth knowing. `/v2/report` carries no idempotency key, so the
-plugin keeps the Beijing day each account was last served and does nothing
-on a second ask that day — a *Check in now* pressed after the daily run
-does not report twice. And an enterprise (team) account has no growth
-centre, and a sign-in by API key reads none: both are left alone.
+Three limits worth knowing.
+
+`/v2/report` carries no idempotency key, so the plugin keeps the Beijing day
+each account was last served and does nothing on a second ask that day — a
+*Check in now* pressed after the daily run does not report twice. That day is
+part of the key the reported codes are held under, not a mark that outlives
+it: the second day reports again, where an account-keyed set would have
+skipped every code the first day had seen until the process restarted.
+
+The whole run is bounded to 30 seconds an account. magpie gives one check-in
+round two minutes for *every* account, and a run that overruns its share is
+recorded failed even though its claim went through, taking the accounts after
+it in the round down too. Past the deadline no new work starts; whatever is
+left of the day's tasks keeps for the next day.
+
+And an enterprise (team) account has no growth centre, and a sign-in by API
+key reads none: both are left alone.
 
 Whether reporting these events on the account's behalf is something an
 account should do is not known, and it is off unless you say so.
